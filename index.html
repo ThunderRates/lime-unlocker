@@ -411,10 +411,33 @@ async function autoAuth(reason){
   }
 }
 
+const INFO = {'2a25':'serial','2a24':'model','2a26':'firmware','2a29':'manufacturer','2a27':'hardware','2a23':'systemID','2a28':'software'};
+async function readDeviceInfo(readChars){
+  for (const c of readChars){
+    const id = c.uuid.slice(4,8).toLowerCase();
+    if (!INFO[id]) continue;
+    try {
+      const v = await c.readValue();
+      const b = new Uint8Array(v.buffer);
+      const s = String.fromCharCode(...b);
+      log('info ' + INFO[id] + ': ' + (ascii(s) ? s : hex(b)));
+      if ((INFO[id] === 'serial' || INFO[id] === 'systemID') && !$('#apass').value.trim()){
+        const digits = s.replace(/\D/g,'');
+        if (digits.length >= 14 && digits.length <= 16){
+          $('#apass').value = digits; $('#imei').value = digits;
+          store.set('imei', digits);
+          log('^ looks like an IMEI - loaded as the auth password', 'ok');
+        }
+      }
+    } catch(e){}
+  }
+}
+
 async function discover(){
   writers = []; readable = null;
   const rows = [];
   const notifyChars = [];
+  const readChars = [];
   // Phase 1: find writable characteristics FAST, before the firmware's auth timer expires.
   // Fall back to probing known service UUIDs one by one if the bulk dump is blocked.
   let services = [];
@@ -437,7 +460,7 @@ async function discover(){
       rows.push(c.uuid.slice(0,8) + ' [' + (p.join(',') || '-') + ']');
       if (c.properties.write || c.properties.writeWithoutResponse) writers.push(c);
       if (c.properties.notify || c.properties.indicate) notifyChars.push(c);
-      if (c.properties.read && !readable) readable = c;
+      if (c.properties.read){ if (!readable) readable = c; readChars.push(c); }
     }
   }
   $('#chars').textContent = rows.join('\n') || 'nothing visible';
@@ -453,9 +476,12 @@ async function discover(){
     });
     if (writers.length) sel.value = '0';
   }
-  log('writable: ' + writers.length + ', notify: ' + notifyChars.length, writers.length ? 'ok' : 'err');
+  log('writable: ' + writers.length + ', notify: ' + notifyChars.length + ', read: ' + readChars.length, writers.length ? 'ok' : 'err');
   if (!writers.length) log('add service UUIDs under Advanced and reconnect', 'err');
   enableControls(writers.length > 0);
+
+  // Phase 1.5: read standard Device Information - the serial number is often the IMEI itself.
+  await readDeviceInfo(readChars);
 
   // Phase 2: authenticate immediately to hold the connection open.
   await autoAuth('on connect');
