@@ -319,7 +319,7 @@ async function solveParallel(known, missing, target){
 }
 
 /* ---- BLE ---- */
-let dev=null, srv=null, writers=[], hb=null, target=null, lastRx=0, manualDrop=false;
+let dev=null, srv=null, writers=[], hb=null, target=null, lastRx=0, manualDrop=false, connectedAt=0;
 const LIME_SERVICES = [
   '0000ffe0-0000-1000-8000-00805f9b34fb',
   '6e400001-b5a3-f393-e0a9-e50e24dcca9e',
@@ -344,9 +344,23 @@ async function tx(bytes){
   throw new Error('every write failed: ' + (lastErr ? lastErr.message : '?'));
 }
 
+async function autoAuth(reason){
+  if (!writers.length) return;
+  const pass = $('#apass').value.trim();
+  if (pass){
+    const frame = 'AT+CMD,' + pass + ',' + Date.now() + ',1,{"lock":0}$';
+    try { await tx(enc.encode(frame)); log('auth sent ' + reason, 'ok'); } catch(e){ log('auth: ' + e.message, 'err'); }
+    try { await tx(P.unlock); } catch(e){}
+  } else {
+    log('no password yet - the link will likely drop in a few seconds. Solve the IMEI (step 3) then reconnect.', 'warn');
+  }
+}
+
 async function discover(){
   writers = [];
   const rows = [];
+  const notifyChars = [];
+  // Phase 1: find writable characteristics FAST, before the firmware's auth timer expires.
   for (const s of await srv.getPrimaryServices()){
     for (const c of await s.getCharacteristics()){
       const p = [];
@@ -356,24 +370,31 @@ async function discover(){
       if (c.properties.read) p.push('read');
       rows.push(c.uuid + ' [' + (p.join(',') || '-') + ']');
       if (c.properties.write || c.properties.writeWithoutResponse) writers.push(c);
-      if (c.properties.notify){
-        try {
-          await c.startNotifications();
-          c.addEventListener('characteristicvaluechanged', e => {
-            lastRx = Date.now();
-            const buf = e.target.value.buffer;
-            const txt = new Uint8Array(buf);
-            const s = String.fromCharCode(...txt);
-            log('rx <- ' + hex(buf) + (ascii(s) ? '   "' + s + '"' : ''), 'ok');
-          });
-        } catch(e){}
-      }
+      if (c.properties.notify) notifyChars.push(c);
     }
   }
   $('#chars').textContent = rows.join('\n') || 'nothing visible';
   log('writable: ' + writers.length, writers.length ? 'ok' : 'err');
   if (!writers.length) log('add service UUIDs under Advanced and reconnect', 'err');
   enableControls(writers.length > 0);
+
+  // Phase 2: authenticate immediately to hold the connection open.
+  await autoAuth('on connect');
+
+  // Phase 3: subscribe to notifications last. One at a time with a gap -
+  // iOS/Bluefy rejects back-to-back subscribes, and this is not on the auth path.
+  for (const c of notifyChars){
+    try {
+      await c.startNotifications();
+      c.addEventListener('characteristicvaluechanged', e => {
+        lastRx = Date.now();
+        const buf = e.target.value.buffer;
+        const s = String.fromCharCode(...new Uint8Array(buf));
+        log('rx <- ' + hex(buf) + (ascii(s) ? '   "' + s + '"' : ''), 'ok');
+      });
+    } catch(e){ log('notify skipped on ' + c.uuid.slice(0,8) + ' (' + e.message + ')', 'sys'); }
+    await sleep(150);
+  }
 }
 
 function enableControls(on){
@@ -394,6 +415,7 @@ $('#connect').onclick = async () => {
     dev = await navigator.bluetooth.requestDevice(opts);
     dev.addEventListener('gattserverdisconnected', gone);
     srv = await dev.gatt.connect();
+    connectedAt = Date.now();
     $('#devname').textContent = dev.name || '(unnamed)';
     log('connected: ' + (dev.name || 'device'), 'ok');
 
@@ -408,7 +430,10 @@ $('#connect').onclick = async () => {
 
 async function gone(){
   clearInterval(hb); hb=null;
-  log('disconnected', 'err');
+  const lasted = connectedAt ? Math.round((Date.now()-connectedAt)/1000) : 0;
+  log('disconnected after ~' + lasted + 's', 'err');
+  if (lasted <= 10 && !$('#apass').value.trim())
+    log('short drop + no password: stock firmware kicks unauthenticated links. Solve the IMEI (step 3), then reconnect - it will auto-authenticate.', 'warn');
   $('#devname').textContent = 'not connected';
   enableControls(false);
   if (!manualDrop && $('#reconnect').checked && dev){
