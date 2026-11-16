@@ -1,0 +1,75 @@
+
+<div id="app">
+  <div class="brand"><span class="dot"></span> LIME BLE</div>
+  <h1>Lime Scooter Unlocker</h1>
+  <p class="sub">Talks straight to the scooter's Bluetooth UART. No Lime servers, no account, no install.</p>
+
+  <div id="env" class="env"></div>
+
+  <section class="card">
+    <div class="step"><b>1</b> Connect</div>
+    <div class="row">
+      <button id="connect" class="primary grow">Scan for lime- scooter</button>
+      <button id="disconnect" disabled="">Drop</button>
+    </div>
+    <label class="chk"><input type="checkbox" id="allDev"> show all BLE devices (if your scooter isn't named lime-XXXX)</label>
+    <div id="devname" class="mono small dim mt">not connected</div>
+  </section>
+
+  <section class="card">
+    <div class="step"><b>2</b> Unlock</div>
+    <div class="row wrap">
+      <button id="auto" class="primary" disabled="">Auto unlock (all 3 protocols)</button>
+    </div>
+    <div class="row wrap">
+      <button data-preset="lock" disabled="">Lock</button>
+      <button data-preset="beep" disabled="">Beep</button>
+      <button data-preset="forever" disabled="">Unlock forever</button>
+    </div>
+    <label class="chk"><input type="checkbox" id="hb"> keep-alive heartbeat (500 ms)</label>
+  </section>
+
+  <section class="card">
+    <div class="step"><b>3</b> Auth <span class="tag">only if step 2 is ignored</span></div>
+    <p class="small dim mt0">Stock firmware drops BLE commands until it authenticates you. The password is the scooter's IMEI. The 8 hex chars in the Bluetooth name are the last 4 bytes of <span class="mono">DES(IMEI, 0x1122334455667788)</span>, so type the first digits of the IMEI and let it solve the rest.</p>
+    <div class="row">
+      <input id="imei" class="mono" placeholder="first 7-12 IMEI digits" inputmode="numeric">
+      <button id="recover" disabled="">Solve</button>
+    </div>
+    <div class="row">
+      <input id="apass" class="mono" placeholder="password (auto-filled on success)">
+      <button id="sendat" disabled="">Send AT</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <details>
+      <summary>Advanced / manual</summary>
+      <div class="lbl">Exposed services &amp; characteristics</div>
+      <div id="chars" class="mono small dim">connect first</div>
+      <div class="lbl">Extra service UUIDs</div>
+      <input id="extra" class="mono" placeholder="comma separated, only if nothing writable shows up">
+      <div class="lbl">Send raw</div>
+      <div class="row">
+        <input id="raw" class="mono" placeholder="hex or ASCII">
+        <button id="sendraw" disabled="">Send</button>
+      </div>
+      <div class="lbl">AT frame</div>
+      <div class="row wrap">
+        <select id="atype" class="mono"><option>ATH</option><option selected="">CMD</option><option>QRY</option><option>DBG</option></select>
+        <input id="adata" class="mono" value="{&quot;lock&quot;:0}">
+      </div>
+    </details>
+  </section>
+
+  <section class="card">
+    <div class="row">
+      <div class="step grow">Log</div>
+      <button id="save">Save as .html</button>
+    </div>
+    <pre id="log" class="mono"></pre>
+  </section>
+</div>
+
+
+
